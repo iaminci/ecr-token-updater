@@ -1,0 +1,43 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ecr-token-refresh
+spec:
+  schedule: "0 */6 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      backoffLimit: 3
+      template:
+        spec:
+          containers:
+          - name: token-updater
+            image: iaminci/ecr-token-updater:latest
+            env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: infisical-credentials
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: infisical-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: INFISICAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: infisical-credentials
+                  key: INFISICAL_TOKEN
+            - name: AWS_REGION
+              value: "ap-south-1"
+            - name: INFISICAL_URL
+              value: "https://app.infisical.com"
+            - name: INFISICAL_PROJECT_ID
+              value: "6483f75e3e4d9a7b9bd30b50"
+            - name: INFISICAL_ENV
+              value: "dev"
+          restartPolicy: OnFailure
