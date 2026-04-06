@@ -4,9 +4,9 @@ This project provides an automated solution for refreshing AWS ECR (Elastic Cont
 
 ## Overview
 
-AWS ECR tokens expire after 12 hours. This automation runs a Kubernetes CronJob every 10 hours to retrieve fresh ECR tokens and update them in Infisical, ensuring your applications always have valid credentials.
+AWS ECR tokens expire after 12 hours. This automation runs a Kubernetes CronJob every 8 hours to retrieve fresh ECR tokens and update them in Infisical, ensuring your applications always have valid credentials. A one-time **Job** in the same manifest runs immediately after deploy so you do not wait for the first CronJob tick.
 
-The solution uses a custom Docker image that packages AWS CLI, Infisical CLI, and an automation script into a lightweight Alpine Linux container.
+The solution uses a custom Docker image that packages AWS CLI (installed via pip), Infisical CLI, and an automation script into a lightweight Alpine Linux container.
 
 ## Components
 
@@ -17,14 +17,19 @@ Builds a lightweight Alpine-based container image with:
 - Bash and utilities (curl, jq)
 - The ECR token update script
 
-### 2. CronJob (`ecr-auth-cornjob.yaml`)
-Kubernetes CronJob that runs every 10 hours to refresh the ECR token.
+### 2. Manifest (`ecr-auth-cronjob.yaml`)
+Single file with two resources (separated by `---`):
 
-**Key Configuration:**
-- **Schedule**: `0 */10 * * *` (every 10 hours)
+**CronJob (`ecr-token-refresh`)** — scheduled refresh.
+
+**Key configuration:**
+- **Schedule**: `0 */8 * * *` (every 8 hours)
 - **Timeout**: 600 seconds (10 minutes)
-- **Retry Policy**: Maximum 3 retries
-- **Concurrency**: Prevents overlapping jobs
+- **Retry policy**: `backoffLimit` 3
+- **Concurrency**: `Forbid` (no overlapping jobs)
+- **History**: 3 successful / 5 failed jobs retained
+
+**Job (`ecr-token-refresh-init`)** — runs once when you first apply the manifest, using the same image and environment as the CronJob, so the secret is updated immediately after deploy.
 
 ### 3. Secret (`secret.yaml`)
 Kubernetes Secret containing AWS credentials and Infisical token.
@@ -35,6 +40,8 @@ Bash script that:
 - Updates the token in Infisical using the CLI
 - Validates all required environment variables
 - Provides comprehensive error handling
+
+Replace example region, Infisical project ID, and environment values in `ecr-auth-cronjob.yaml` with your own; do not commit real credentials in `secret.yaml`.
 
 ## Prerequisites
 
@@ -76,7 +83,7 @@ You have two options for the Docker image:
 Use the publicly available image directly without building anything:
 
 ```yaml
-# In ecr-auth-cornjob.yaml
+# In ecr-auth-cronjob.yaml
 image: iaminci/ecr-token-updater:latest
 ```
 
@@ -98,7 +105,7 @@ docker build -t your-dockerhub-username/ecr-token-updater:latest .
 docker push your-dockerhub-username/ecr-token-updater:latest
 ```
 
-Then update the image reference in `ecr-auth-cornjob.yaml`:
+Then update the image reference in `ecr-auth-cronjob.yaml` for both the CronJob and the `ecr-token-refresh-init` Job:
 
 ```yaml
 containers:
@@ -127,24 +134,25 @@ data:
   INFISICAL_TOKEN: <your_base64_encoded_infisical_token>
 ```
 
-### Step 3: Configure the CronJob
+### Step 4: Configure the CronJob and Init Job
 
-Update the environment variables in `ecr-auth-cornjob.yaml`:
+Update the environment variables in `ecr-auth-cronjob.yaml` (under both the CronJob and the `ecr-token-refresh-init` Job):
 
 - **AWS_REGION**: Your AWS region (e.g., `ap-south-1`)
 - **INFISICAL_URL**: Your Infisical instance URL (defaults to `https://app.infisical.com`)
 - **INFISICAL_PROJECT_ID**: Your Infisical project ID
 - **INFISICAL_ENV**: Target environment (e.g., `dev`, `staging`, `prod`)
 
-### Step 4: Deploy to Kubernetes
+### Step 5: Deploy to Kubernetes
+
+Apply the Secret first, then the manifest that contains the CronJob and init Job:
 
 ```bash
-# Create the secret
 kubectl apply -f secret.yaml
-
-# Deploy the CronJob
-kubectl apply -f ecr-auth-cornjob.yaml
+kubectl apply -f ecr-auth-cronjob.yaml
 ```
+
+The init Job `ecr-token-refresh-init` starts as soon as the Secret exists. If you apply the same Job again later, Kubernetes will not re-run a completed Job with the same name; delete it first if you need another immediate run: `kubectl delete job ecr-token-refresh-init`, then `kubectl apply -f ecr-auth-cronjob.yaml` again.
 
 ### Step 6: Verify Deployment
 
@@ -155,11 +163,14 @@ kubectl get cronjob ecr-token-refresh
 # View CronJob details
 kubectl describe cronjob ecr-token-refresh
 
-# Check recent job executions
-kubectl get jobs --selector=job-name=ecr-token-refresh
+# List Jobs created by the CronJob (controller sets this label)
+kubectl get jobs -l cronjob.kubernetes.io/name=ecr-token-refresh
 
-# View logs from the most recent job
-kubectl logs -l job-name=ecr-token-refresh --tail=50
+# Init Job (first run on deploy)
+kubectl logs job/ecr-token-refresh-init
+
+# Logs for a specific CronJob-created Job — use the exact name from kubectl get jobs
+kubectl logs job/ecr-token-refresh-<timestamp-suffix> --tail=50
 ```
 
 ## Configuration Reference
@@ -181,24 +192,22 @@ kubectl logs -l job-name=ecr-token-refresh --tail=50
 ### Check Job History
 
 ```bash
-# List all jobs created by the CronJob
-kubectl get jobs -l app=ecr-token-refresh
+# Jobs created by the CronJob
+kubectl get jobs -l cronjob.kubernetes.io/name=ecr-token-refresh
 
-# View recent successful jobs (keeps last 3)
-kubectl get jobs --selector=job-name=ecr-token-refresh --field-selector status.successful=1
-
-# View recent failed jobs (keeps last 5)
-kubectl get jobs --selector=job-name=ecr-token-refresh --field-selector status.failed=1
+# Field selectors (optional) — combine with the label above if your kubectl version supports it
+kubectl get jobs -l cronjob.kubernetes.io/name=ecr-token-refresh --field-selector status.successful=1
+kubectl get jobs -l cronjob.kubernetes.io/name=ecr-token-refresh --field-selector status.failed=1
 ```
 
 ### View Logs
 
 ```bash
-# Get logs from the latest job
-kubectl logs -l job-name=ecr-token-refresh --tail=100
+# Init Job (one-time deploy)
+kubectl logs job/ecr-token-refresh-init --tail=100
 
-# Get logs from a specific job
-kubectl logs job/ecr-token-refresh-<timestamp>
+# A CronJob-created Job — copy the full job name from: kubectl get jobs
+kubectl logs job/<full-job-name> --tail=100
 ```
 
 ## Troubleshooting
@@ -236,11 +245,12 @@ kubectl get secret infisical-credentials
 
 ### Manual Test Run
 
-To manually trigger the job:
+To trigger the same workload as the CronJob without waiting for the schedule, use a **unique** Job name each time:
 
 ```bash
-kubectl create job ecr-token-refresh-manual --from=cronjob/ecr-token-refresh
-kubectl logs -f job/ecr-token-refresh-manual
+JOB="ecr-token-refresh-manual-$(date +%s)"
+kubectl create job "$JOB" --from=cronjob/ecr-token-refresh
+kubectl logs -f "job/$JOB"
 ```
 
 ## Security Best Practices
@@ -255,18 +265,18 @@ kubectl logs -f job/ecr-token-refresh-manual
 
 ### Change Schedule
 
-Modify the `schedule` field in `ecr-auth-cornjob.yaml`:
+Modify the `schedule` field under the CronJob in `ecr-auth-cronjob.yaml`. Example — every 10 hours:
 
 ```yaml
 spec:
-  schedule: "0 */8 * * *"  # Every 8 hours
+  schedule: "0 */10 * * *"  # Every 10 hours
 ```
 
-**Current schedule**: Every 10 hours (`0 */10 * * *`)
+**Current schedule**: Every 8 hours (`0 */8 * * *`).
 
 ### Adjust Timeout
 
-Modify the `activeDeadlineSeconds`:
+Modify the `activeDeadlineSeconds` on the CronJob `jobTemplate` and/or the init Job:
 
 ```yaml
 activeDeadlineSeconds: 300  # 5 minutes
@@ -286,8 +296,9 @@ To remove all resources:
 
 ```bash
 kubectl delete cronjob ecr-token-refresh
+kubectl delete job ecr-token-refresh-init
 kubectl delete secret infisical-credentials
-kubectl delete jobs -l job-name=ecr-token-refresh
+kubectl delete jobs -l cronjob.kubernetes.io/name=ecr-token-refresh
 ```
 
 ## License
@@ -298,5 +309,6 @@ This project is provided as-is for automation of ECR token management.
 
 For issues or questions:
 - Check Kubernetes events: `kubectl get events --sort-by='.lastTimestamp'`
-- Review job logs: `kubectl logs -l job-name=ecr-token-refresh`
+- Review init Job logs: `kubectl logs job/ecr-token-refresh-init`
+- Review CronJob-created jobs: `kubectl get jobs -l cronjob.kubernetes.io/name=ecr-token-refresh` then `kubectl logs job/<name>`
 - Verify AWS CLI works: Test AWS credentials outside the container
