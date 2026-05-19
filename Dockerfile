@@ -6,7 +6,9 @@ RUN apk add --no-cache \
     jq \
     py3-pip \
     bash \
-    && pip3 install awscli --break-system-packages \
+    && pip3 install --break-system-packages \
+        awscli \
+        "setuptools>=78.1.1" \
     && rm -rf /var/cache/apk/*
 
 # Install Infisical CLI
